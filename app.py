@@ -2,8 +2,17 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 
-# --- Helper Functions (Previously Working Logic) ---
+# --- 1. SETTINGS & CONNECTION ---
+st.set_page_config(page_title="Global Financial Analyser", layout="wide")
+
+# Setup a session to avoid being blocked by Yahoo Finance
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+})
+
 def safe_float(value):
     try:
         if value is None or pd.isna(value): return None
@@ -18,41 +27,99 @@ def format_large_num(value):
     if abs(num) >= 1e6: return f"{num/1e6:,.2f}M"
     return f"{num:,.2f}"
 
-def get_financial_metrics(ticker):
-    stock = yf.Ticker(ticker)
+def safe_round(value, decimals=2):
+    num = safe_float(value)
+    return round(num, decimals) if num is not None else "N/A"
+
+def get_financial_metrics(ticker_symbol):
+    # Pass the session here
+    stock = yf.Ticker(ticker_symbol, session=session)
     info = stock.info
-    # ... [Insert your working get_financial_metrics logic here] ...
-    # Ensure it uses the 'safe_float' and 'format_large_num' functions defined above
-    return {"Ticker": ticker, "Market Cap": format_large_num(info.get("marketCap"))} # Simplified for example
+    
+    if not info or len(info) < 5:
+        raise ValueError("Data unavailable")
 
-# --- Streamlit Web Interface ---
-st.set_page_config(page_title="Global Stock Analyser", layout="wide")
-st.title("📈 Global Financial Stock Analyser")
+    # Price and Yield Logic
+    price = safe_float(info.get("currentPrice") or info.get("previousClose"))
+    divs = stock.dividends
+    manual_yield = 0
+    if not divs.empty and price and price > 0:
+        last_year_divs = divs[divs.index > (pd.Timestamp.now(tz='UTC') - pd.DateOffset(years=1))].sum()
+        # Handle LSE pence/pounds conversion
+        if ticker_symbol.endswith(".L") and price > 10: 
+             manual_yield = (last_year_divs / (price / 100)) * 100
+        else:
+             manual_yield = (last_year_divs / price) * 100
 
-# Sidebar for Country Selection
-st.sidebar.header("Settings")
-country = st.sidebar.selectbox("Select Target Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA (NYSE/NASDAQ)", "Manual Suffix"])
+    pe_val = safe_float(info.get("trailingPE"))
+    
+    data = {
+        "Ticker": ticker_symbol,
+        "Market Cap": format_large_num(info.get("marketCap")),
+        "Net Debt": format_large_num((info.get("totalDebt", 0) or 0) - (info.get("totalCash", 0) or 0)),
+        "PE Ratio": safe_round(pe_val) if (pe_val and pe_val > 0) else "Neg. EPS",
+        "Div Yield (%)": safe_round(manual_yield)
+    }
 
-# Text Input for Stock Codes
-raw_input = st.text_input("Enter Stock Codes (comma separated, e.g. CBA, WBC, BP)", value="CBA, BP")
+    # Growth Logic (EPS & DPS)
+    income = stock.financials
+    if not income.empty and 'Diluted EPS' in income.index:
+        eps = income.loc['Diluted EPS'].dropna()
+        if len(eps) >= 2:
+            v_curr, v_prev = safe_float(eps.iloc[0]), safe_float(eps.iloc[1])
+            if v_curr is not None and v_prev and v_prev != 0:
+                data["EPS Gth 1yr %"] = safe_round(((v_curr / v_prev) - 1) * 100)
+        if len(eps) >= 4:
+            v_curr, v_old = safe_float(eps.iloc[0]), safe_float(eps.iloc[3])
+            if v_curr is not None and v_old and v_old > 0:
+                data["EPS Gth 3yr %"] = safe_round(((v_curr / v_old)**(1/3) - 1) * 100)
 
-# Mapping Logic
-suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA (NYSE/NASDAQ)": "", "Manual Suffix": ""}
-suffix = suffix_map[country]
+    if not divs.empty:
+        annual_divs = divs.resample('YE').sum()
+        if len(annual_divs) >= 2:
+            d_curr, d_prev = safe_float(annual_divs.iloc[-1]), safe_float(annual_divs.iloc[-2])
+            if d_curr is not None and d_prev and d_prev > 0:
+                data["DPS Gth 1yr %"] = safe_round(((d_curr / d_prev) - 1) * 100)
+        if len(annual_divs) >= 4:
+            d_curr, d_old = safe_float(annual_divs.iloc[-1]), safe_float(annual_divs.iloc[-4])
+            if d_curr is not None and d_old and d_old > 0:
+                data["DPS Gth 3yr %"] = safe_round(((d_curr / d_old)**(1/3) - 1) * 100)
+
+    return data
+
+# --- 2. STREAMLIT INTERFACE ---
+st.title("📊 Global Stock Fundamental Analyser")
+
+c1, c2 = st.columns([1, 2])
+with c1:
+    market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA (NYSE/NASDAQ)", "Manual"])
+with c2:
+    input_text = st.text_input("Enter Ticker Codes (comma separated)", value="BHP, CBA, AAPL")
+
+# Suffix Handling
+suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA (NYSE/NASDAQ)": "", "Manual": ""}
+target_suffix = suffix_map[market]
 
 if st.button("Analyse Stocks"):
-    # Clean and append suffixes
-    tickers = [t.strip().upper() + suffix for t in raw_input.split(",") if t.strip()]
+    # Split input and clean ticker names
+    raw_list = [t.strip().upper() for t in input_text.split(",") if t.strip()]
     
-    with st.spinner(f"Fetching data for {len(tickers)} stocks..."):
-        results = []
-        for t in tickers:
+    processed_tickers = []
+    for t in raw_list:
+        # Prevent double suffixes like BHP.AX.AX
+        clean_t = t.replace(".AX", "").replace(".L", "") + target_suffix
+        processed_tickers.append(clean_t)
+    
+    results = []
+    with st.spinner("Fetching financial data..."):
+        for t in processed_tickers:
             try:
-                data = get_financial_metrics(t)
-                results.append(data)
-            except:
-                st.error(f"Could not find data for {t}")
-        
-        if results:
-            df = pd.DataFrame(results).set_index("Ticker").T
-            st.dataframe(df, use_container_width=True)
+                results.append(get_financial_metrics(t))
+            except Exception as e:
+                st.warning(f"Could not fetch {t}: Data unavailable or Ticker incorrect.")
+    
+    if results:
+        df = pd.DataFrame(results).set_index("Ticker").T
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.error("No data could be retrieved for the entered tickers.")
