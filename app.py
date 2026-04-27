@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 import io
 import time
 
-# --- 1. CONFIGURATION & HELPERS ---
-st.set_page_config(page_title="Global Stock Analyser", layout="wide")
+# --- 1. SETTINGS & HELPERS ---
+st.set_page_config(page_title="Global Financial Analyser", layout="wide")
 
 def safe_float(value):
     try:
@@ -28,11 +28,9 @@ def safe_round(value, decimals=2):
     return round(num, decimals) if num is not None else "N/A"
 
 def create_table_image(df):
-    """Generates a high-res PNG of the results table."""
     fig, ax = plt.subplots(figsize=(max(10, len(df.columns)*1.5), 5))
     ax.axis('off')
-    tbl = ax.table(cellText=df.values, colLabels=df.columns, rowLabels=df.index, 
-                   loc='center', cellLoc='center')
+    tbl = ax.table(cellText=df.values, colLabels=df.columns, rowLabels=df.index, loc='center', cellLoc='center')
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(11)
     tbl.scale(1.2, 2.5)
@@ -41,32 +39,38 @@ def create_table_image(df):
     buf.seek(0)
     return buf
 
-# --- 2. CACHED DATA FETCHING ---
-# This saves results for 12 hours to avoid "Too Many Requests" errors
+# --- 2. IMPROVED DATA FETCHING ---
 @st.cache_data(ttl=43200)
 def get_financial_metrics(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
     
-    # Small history fetch to 'wake up' the API
-    _ = stock.history(period="5d")
+    # Force history fetch to wake up API metadata
+    hist = stock.history(period="1mo")
     info = stock.info
-    divs = stock.dividends
     
+    # STABILITY FIX: Use 'actions' if 'dividends' attribute fails or is empty
+    try:
+        actions = stock.actions
+        divs = actions['Dividends'] if not actions.empty and 'Dividends' in actions.columns else pd.Series(dtype=float)
+    except:
+        divs = pd.Series(dtype=float)
+    
+    # Fallback price check
     price = safe_float(info.get("currentPrice") or info.get("previousClose"))
-    if not price:
-        hist = stock.history(period="1d")
-        if not hist.empty: price = float(hist['Close'].iloc[-1])
-        else: raise ValueError("Price Unavailable")
+    if not price and not hist.empty:
+        price = float(hist['Close'].iloc[-1])
+    elif not price:
+        raise ValueError("Price Unavailable")
 
-    # TTM Dividend Logic (Morningstar alignment)
+    # TTM Dividend Logic (Trailing 12 Months)
     now = pd.Timestamp.now(tz='UTC')
-    ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum()
-    y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum()
-    y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum()
+    ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum() if not divs.empty else 0
+    y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum() if not divs.empty else 0
+    y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum() if not divs.empty else 0
 
-    # LSE Correction
+    # LSE Conversion and manual yield calculation
     denom = price / 100 if ticker_symbol.endswith(".L") and price > 10 else price
-    manual_yield = (ttm_sum / denom) * 100
+    manual_yield = (ttm_sum / denom) * 100 if denom > 0 else 0
 
     pe_val = safe_float(info.get("trailingPE"))
     
@@ -78,7 +82,7 @@ def get_financial_metrics(ticker_symbol):
         "Div Yield (%)": safe_round(manual_yield)
     }
 
-    # EPS Growth
+    # EPS & DPS Growth
     income = stock.financials
     if not income.empty and 'Diluted EPS' in income.index:
         eps = income.loc['Diluted EPS'].dropna()
@@ -91,24 +95,20 @@ def get_financial_metrics(ticker_symbol):
             if v_curr is not None and v_old and v_old > 0:
                 data["EPS Gth 3yr %"] = safe_round(((v_curr / v_old)**(1/3) - 1) * 100)
 
-    # DPS Growth (TTM Windows)
     if ttm_sum > 0:
-        if y1_sum > 0:
-            data["DPS Gth 1yr %"] = safe_round(((ttm_sum / y1_sum) - 1) * 100)
-        if y3_sum > 0:
-            data["DPS Gth 3yr %"] = safe_round(((ttm_sum / y3_sum)**(1/3) - 1) * 100)
+        if y1_sum > 0: data["DPS Gth 1yr %"] = safe_round(((ttm_sum / y1_sum) - 1) * 100)
+        if y3_sum > 0: data["DPS Gth 3yr %"] = safe_round(((ttm_sum / y3_sum)**(1/3) - 1) * 100)
 
     return data
 
-# --- 3. USER INTERFACE ---
+# --- 3. INTERFACE ---
 st.title("📊 Global Stock Fundamental Analyser")
-st.info("Results are cached for 12 hours to prevent API rate-limiting.")
 
 c1, c2 = st.columns(2)
 with c1:
     market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual"])
 with c2:
-    input_text = st.text_input("Enter Ticker Codes", value="DDR, CBA, BHP")
+    input_text = st.text_input("Enter Ticker Codes", value="FMG, WTL, APL")
 
 suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual": ""}
 target_suffix = suffix_map[market]
@@ -118,19 +118,13 @@ if st.button("Analyse Stocks"):
     processed_tickers = [t.replace(".AX", "").replace(".L", "") + target_suffix for t in raw_list]
     
     results = []
-    # Add a progress bar to show status
     progress_bar = st.progress(0)
     
     with st.spinner("Accessing financial data..."):
         for i, t in enumerate(processed_tickers):
             try:
-                # Update progress bar
                 progress_bar.progress((i + 1) / len(processed_tickers))
-                
-                # Fetch data (will use cache if available)
                 results.append(get_financial_metrics(t))
-                
-                # Small delay to satisfy Yahoo's rate limiting
                 time.sleep(1.0) 
             except Exception as e:
                 st.warning(f"Could not retrieve {t}: {str(e)}")
@@ -139,14 +133,7 @@ if st.button("Analyse Stocks"):
         df = pd.DataFrame(results).set_index("Ticker").T
         st.dataframe(df, use_container_width=True)
         
-        # Image Download Section
         st.divider()
         img_buf = create_table_image(df)
-        st.download_button(
-            label="📩 Download Table as Image (PNG)",
-            data=img_buf,
-            file_name="stock_analysis.png",
-            mime="image/png"
-        )
-    else:
-        st.error("No valid data retrieved. Try again in a few minutes.")
+        st.download_button(label="📩 Download Table as Image (PNG)", data=img_buf, file_name="stock_analysis.png", mime="image/png")
+
