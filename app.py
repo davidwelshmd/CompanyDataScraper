@@ -25,7 +25,6 @@ def safe_round(value, decimals=2):
     return round(num, decimals) if num is not None else "N/A"
 
 def get_financial_metrics(ticker_symbol):
-    # No custom session - let yfinance handle its own 'curl_cffi' session
     stock = yf.Ticker(ticker_symbol)
     
     # Force-fetch metadata
@@ -90,7 +89,9 @@ def get_financial_metrics(ticker_symbol):
 # --- 2. INTERFACE ---
 st.title("📊 Global Stock Analyser")
 
-c1, c2 = st.columns()
+# FIXED: Added the number 2 to specify two columns
+c1, c2 = st.columns(2) 
+
 with c1:
     market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual"])
 with c2:
