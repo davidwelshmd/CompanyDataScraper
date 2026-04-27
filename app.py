@@ -2,9 +2,11 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import io
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Global Stock Analyser", layout="wide")
+# --- 1. CONFIGURATION & HELPERS ---
+st.set_page_config(page_title="Global Financial Analyser", layout="wide")
 
 def safe_float(value):
     try:
@@ -24,31 +26,44 @@ def safe_round(value, decimals=2):
     num = safe_float(value)
     return round(num, decimals) if num is not None else "N/A"
 
+def create_table_image(df):
+    """Generates a high-res PNG of the results table."""
+    fig, ax = plt.subplots(figsize=(max(10, len(df.columns)*1.5), 5))
+    ax.axis('off')
+    tbl = ax.table(cellText=df.values, colLabels=df.columns, rowLabels=df.index, 
+                   loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.2, 2.5)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches='tight', dpi=300)
+    buf.seek(0)
+    return buf
+
 def get_financial_metrics(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
     
-    # Force-fetch metadata
+    # Force-fetch metadata for reliability
     _ = stock.history(period="5d")
     info = stock.info
+    divs = stock.dividends
     
-    # Price Check
+    # 1. Price and Basic Stats
     price = safe_float(info.get("currentPrice") or info.get("previousClose"))
     if not price:
         hist = stock.history(period="1d")
-        if not hist.empty:
-            price = float(hist['Close'].iloc[-1])
-        else:
-            raise ValueError("No price available")
+        if not hist.empty: price = float(hist['Close'].iloc[-1])
+        else: raise ValueError("Price Unavailable")
 
-    # Yield Calculation
-    divs = stock.dividends
-    manual_yield = 0
-    if not divs.empty and price > 0:
-        last_year_divs = divs[divs.index > (pd.Timestamp.now(tz='UTC') - pd.DateOffset(years=1))].sum()
-        if ticker_symbol.endswith(".L") and price > 10: 
-             manual_yield = (last_year_divs / (price / 100)) * 100
-        else:
-             manual_yield = (last_year_divs / price) * 100
+    # 2. Advanced Dividend Logic (TTM Aggregation)
+    # Prevents incorrect spikes by summing full years
+    now = pd.Timestamp.now(tz='UTC')
+    ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum()
+    y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum()
+    y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum()
+
+    # LSE Pence-to-Pound Correction
+    manual_yield = (ttm_sum / (price / 100 if ticker_symbol.endswith(".L") and price > 10 else price)) * 100
 
     pe_val = safe_float(info.get("trailingPE"))
     
@@ -60,7 +75,7 @@ def get_financial_metrics(ticker_symbol):
         "Div Yield (%)": safe_round(manual_yield)
     }
 
-    # Growth Logic
+    # 3. EPS Growth
     income = stock.financials
     if not income.empty and 'Diluted EPS' in income.index:
         eps = income.loc['Diluted EPS'].dropna()
@@ -73,29 +88,23 @@ def get_financial_metrics(ticker_symbol):
             if v_curr is not None and v_old and v_old > 0:
                 data["EPS Gth 3yr %"] = safe_round(((v_curr / v_old)**(1/3) - 1) * 100)
 
-    if not divs.empty:
-        annual_divs = divs.resample('YE').sum()
-        if len(annual_divs) >= 2:
-            d_curr, d_prev = safe_float(annual_divs.iloc[-1]), safe_float(annual_divs.iloc[-2])
-            if d_curr is not None and d_prev and d_prev > 0:
-                data["DPS Gth 1yr %"] = safe_round(((d_curr / d_prev) - 1) * 100)
-        if len(annual_divs) >= 4:
-            d_curr, d_old = safe_float(annual_divs.iloc[-1]), safe_float(annual_divs.iloc[-4])
-            if d_curr is not None and d_old and d_old > 0:
-                data["DPS Gth 3yr %"] = safe_round(((d_curr / d_old)**(1/3) - 1) * 100)
+    # 4. DPS Growth (using TTM windows)
+    if ttm_sum > 0:
+        if y1_sum > 0:
+            data["DPS Gth 1yr %"] = safe_round(((ttm_sum / y1_sum) - 1) * 100)
+        if y3_sum > 0:
+            data["DPS Gth 3yr %"] = safe_round(((ttm_sum / y3_sum)**(1/3) - 1) * 100)
 
     return data
 
 # --- 2. INTERFACE ---
-st.title("📊 Global Stock Analyser")
+st.title("📊 Global Stock Fundamental Analyser")
 
-# FIXED: Added the number 2 to specify two columns
-c1, c2 = st.columns(2) 
-
+c1, c2 = st.columns(2)
 with c1:
     market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual"])
 with c2:
-    input_text = st.text_input("Enter Ticker Codes", value="BHP, CBA, WTL")
+    input_text = st.text_input("Enter Ticker Codes", value="DDR, CBA, BHP")
 
 suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual": ""}
 target_suffix = suffix_map[market]
@@ -105,7 +114,7 @@ if st.button("Analyse Stocks"):
     processed_tickers = [t.replace(".AX", "").replace(".L", "") + target_suffix for t in raw_list]
     
     results = []
-    with st.spinner("Fetching data..."):
+    with st.spinner("Fetching financial records..."):
         for t in processed_tickers:
             try:
                 results.append(get_financial_metrics(t))
@@ -115,3 +124,15 @@ if st.button("Analyse Stocks"):
     if results:
         df = pd.DataFrame(results).set_index("Ticker").T
         st.dataframe(df, use_container_width=True)
+        
+        # Image Download Section
+        st.divider()
+        img_buf = create_table_image(df)
+        st.download_button(
+            label="📩 Download Table as Image (PNG)",
+            data=img_buf,
+            file_name="stock_analysis.png",
+            mime="image/png"
+        )
+    else:
+        st.error("No valid data retrieved.")
