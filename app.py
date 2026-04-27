@@ -4,9 +4,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import io
+import time
 
 # --- 1. CONFIGURATION & HELPERS ---
-st.set_page_config(page_title="Global Financial Analyser", layout="wide")
+st.set_page_config(page_title="Global Stock Analyser", layout="wide")
 
 def safe_float(value):
     try:
@@ -40,30 +41,32 @@ def create_table_image(df):
     buf.seek(0)
     return buf
 
+# --- 2. CACHED DATA FETCHING ---
+# This saves results for 12 hours to avoid "Too Many Requests" errors
+@st.cache_data(ttl=43200)
 def get_financial_metrics(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
     
-    # Force-fetch metadata for reliability
+    # Small history fetch to 'wake up' the API
     _ = stock.history(period="5d")
     info = stock.info
     divs = stock.dividends
     
-    # 1. Price and Basic Stats
     price = safe_float(info.get("currentPrice") or info.get("previousClose"))
     if not price:
         hist = stock.history(period="1d")
         if not hist.empty: price = float(hist['Close'].iloc[-1])
         else: raise ValueError("Price Unavailable")
 
-    # 2. Advanced Dividend Logic (TTM Aggregation)
-    # Prevents incorrect spikes by summing full years
+    # TTM Dividend Logic (Morningstar alignment)
     now = pd.Timestamp.now(tz='UTC')
     ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum()
     y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum()
     y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum()
 
-    # LSE Pence-to-Pound Correction
-    manual_yield = (ttm_sum / (price / 100 if ticker_symbol.endswith(".L") and price > 10 else price)) * 100
+    # LSE Correction
+    denom = price / 100 if ticker_symbol.endswith(".L") and price > 10 else price
+    manual_yield = (ttm_sum / denom) * 100
 
     pe_val = safe_float(info.get("trailingPE"))
     
@@ -75,7 +78,7 @@ def get_financial_metrics(ticker_symbol):
         "Div Yield (%)": safe_round(manual_yield)
     }
 
-    # 3. EPS Growth
+    # EPS Growth
     income = stock.financials
     if not income.empty and 'Diluted EPS' in income.index:
         eps = income.loc['Diluted EPS'].dropna()
@@ -88,7 +91,7 @@ def get_financial_metrics(ticker_symbol):
             if v_curr is not None and v_old and v_old > 0:
                 data["EPS Gth 3yr %"] = safe_round(((v_curr / v_old)**(1/3) - 1) * 100)
 
-    # 4. DPS Growth (using TTM windows)
+    # DPS Growth (TTM Windows)
     if ttm_sum > 0:
         if y1_sum > 0:
             data["DPS Gth 1yr %"] = safe_round(((ttm_sum / y1_sum) - 1) * 100)
@@ -97,8 +100,9 @@ def get_financial_metrics(ticker_symbol):
 
     return data
 
-# --- 2. INTERFACE ---
+# --- 3. USER INTERFACE ---
 st.title("📊 Global Stock Fundamental Analyser")
+st.info("Results are cached for 12 hours to prevent API rate-limiting.")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -114,10 +118,20 @@ if st.button("Analyse Stocks"):
     processed_tickers = [t.replace(".AX", "").replace(".L", "") + target_suffix for t in raw_list]
     
     results = []
-    with st.spinner("Fetching financial records..."):
-        for t in processed_tickers:
+    # Add a progress bar to show status
+    progress_bar = st.progress(0)
+    
+    with st.spinner("Accessing financial data..."):
+        for i, t in enumerate(processed_tickers):
             try:
+                # Update progress bar
+                progress_bar.progress((i + 1) / len(processed_tickers))
+                
+                # Fetch data (will use cache if available)
                 results.append(get_financial_metrics(t))
+                
+                # Small delay to satisfy Yahoo's rate limiting
+                time.sleep(1.0) 
             except Exception as e:
                 st.warning(f"Could not retrieve {t}: {str(e)}")
     
@@ -135,4 +149,4 @@ if st.button("Analyse Stocks"):
             mime="image/png"
         )
     else:
-        st.error("No valid data retrieved.")
+        st.error("No valid data retrieved. Try again in a few minutes.")
