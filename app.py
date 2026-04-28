@@ -39,36 +39,39 @@ def create_table_image(df):
     buf.seek(0)
     return buf
 
-# --- 2. IMPROVED DATA FETCHING ---
+# --- 2. THE DATA ENGINE ---
 @st.cache_data(ttl=43200)
 def get_financial_metrics(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
     
-    # Force history fetch to wake up API metadata
-    hist = stock.history(period="1mo")
+    # Force metadata fetch
     info = stock.info
     
-    # STABILITY FIX: Use 'actions' if 'dividends' attribute fails or is empty
+    # --- MULTI-STAGE PRICE FETCH (Fallback Logic) ---
+    price = safe_float(info.get("currentPrice") or info.get("previousClose") or info.get("regularMarketPrice"))
+    
+    if not price:
+        # Try history as a fallback
+        hist = stock.history(period="5d")
+        if not hist.empty:
+            price = float(hist['Close'].iloc[-1])
+        else:
+            raise ValueError("Price Unavailable - Check Ticker Suffix")
+
+    # Safe Dividend Access
     try:
         actions = stock.actions
         divs = actions['Dividends'] if not actions.empty and 'Dividends' in actions.columns else pd.Series(dtype=float)
     except:
         divs = pd.Series(dtype=float)
     
-    # Fallback price check
-    price = safe_float(info.get("currentPrice") or info.get("previousClose"))
-    if not price and not hist.empty:
-        price = float(hist['Close'].iloc[-1])
-    elif not price:
-        raise ValueError("Price Unavailable")
-
-    # TTM Dividend Logic (Trailing 12 Months)
+    # TTM Dividend Logic
     now = pd.Timestamp.now(tz='UTC')
     ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum() if not divs.empty else 0
     y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum() if not divs.empty else 0
     y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum() if not divs.empty else 0
 
-    # LSE Conversion and manual yield calculation
+    # LSE Correction
     denom = price / 100 if ticker_symbol.endswith(".L") and price > 10 else price
     manual_yield = (ttm_sum / denom) * 100 if denom > 0 else 0
 
@@ -82,7 +85,7 @@ def get_financial_metrics(ticker_symbol):
         "Div Yield (%)": safe_round(manual_yield)
     }
 
-    # EPS & DPS Growth
+    # Growth Logic
     income = stock.financials
     if not income.empty and 'Diluted EPS' in income.index:
         eps = income.loc['Diluted EPS'].dropna()
@@ -106,34 +109,44 @@ st.title("📊 Global Stock Fundamental Analyser")
 
 c1, c2 = st.columns(2)
 with c1:
-    market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual"])
+    market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual (Suffix included in code)"])
 with c2:
-    input_text = st.text_input("Enter Ticker Codes", value="FMG, WTL, APL")
+    input_text = st.text_input("Enter Ticker Codes (comma separated)", value="GOOGL, WISE.L, FMG.AX, WTL.AX, TPC.AX")
 
-suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual": ""}
-target_suffix = suffix_map[market]
-
+# Logic to clean tickers and apply suffixes correctly
 if st.button("Analyse Stocks"):
+    suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual (Suffix included in code)": ""}
+    target_suffix = suffix_map[market]
+    
     raw_list = [t.strip().upper() for t in input_text.split(",") if t.strip()]
-    processed_tickers = [t.replace(".AX", "").replace(".L", "") + target_suffix for t in raw_list]
+    
+    processed_tickers = []
+    for t in raw_list:
+        # Strip existing suffixes to prevent BHP.AX.AX
+        base = t.split(".")[0]
+        # If user selected Manual or typed a suffix manually, prioritize that
+        if "." in t:
+            processed_tickers.append(t)
+        else:
+            processed_tickers.append(base + target_suffix)
     
     results = []
     progress_bar = st.progress(0)
     
-    with st.spinner("Accessing financial data..."):
+    with st.spinner("Fetching data..."):
         for i, t in enumerate(processed_tickers):
             try:
                 progress_bar.progress((i + 1) / len(processed_tickers))
                 results.append(get_financial_metrics(t))
-                time.sleep(1.0) 
+                time.sleep(1.0) # Compliance delay
             except Exception as e:
                 st.warning(f"Could not retrieve {t}: {str(e)}")
     
     if results:
         df = pd.DataFrame(results).set_index("Ticker").T
         st.dataframe(df, use_container_width=True)
-        
         st.divider()
         img_buf = create_table_image(df)
-        st.download_button(label="📩 Download Table as Image (PNG)", data=img_buf, file_name="stock_analysis.png", mime="image/png")
+        st.download_button(label="📩 Download Table as Image", data=img_buf, file_name="stock_analysis.png", mime="image/png")
+
 
