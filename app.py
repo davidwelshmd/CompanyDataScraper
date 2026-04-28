@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import io
 import time
 
-# --- 1. SETTINGS & HELPERS ---
+# --- 1. CONFIGURATION & HELPERS ---
 st.set_page_config(page_title="Global Financial Analyser", layout="wide")
 
 def safe_float(value):
@@ -28,9 +28,11 @@ def safe_round(value, decimals=2):
     return round(num, decimals) if num is not None else "N/A"
 
 def create_table_image(df):
+    """Generates a high-res PNG of the results table."""
     fig, ax = plt.subplots(figsize=(max(10, len(df.columns)*1.5), 5))
     ax.axis('off')
-    tbl = ax.table(cellText=df.values, colLabels=df.columns, rowLabels=df.index, loc='center', cellLoc='center')
+    tbl = ax.table(cellText=df.values, colLabels=df.columns, rowLabels=df.index, 
+                   loc='center', cellLoc='center')
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(11)
     tbl.scale(1.2, 2.5)
@@ -39,53 +41,48 @@ def create_table_image(df):
     buf.seek(0)
     return buf
 
-# --- 2. THE DATA ENGINE ---
+# --- 2. CACHED DATA FETCHING ---
+# TTL is set to 12 hours (43,200 seconds)
 @st.cache_data(ttl=43200)
 def get_financial_metrics(ticker_symbol):
+    # yfinance 0.2.54+ handles browser impersonation internally
     stock = yf.Ticker(ticker_symbol)
     
-    # Force metadata fetch
+    # Wake up the API
+    _ = stock.history(period="1mo")
     info = stock.info
     
-    # --- MULTI-STAGE PRICE FETCH (Fallback Logic) ---
-    price = safe_float(info.get("currentPrice") or info.get("previousClose") or info.get("regularMarketPrice"))
-    
-    if not price:
-        # Try history as a fallback
-        hist = stock.history(period="5d")
-        if not hist.empty:
-            price = float(hist['Close'].iloc[-1])
-        else:
-            raise ValueError("Price Unavailable - Check Ticker Suffix")
-
-    # Safe Dividend Access
+    # Secure dividend access
     try:
         actions = stock.actions
         divs = actions['Dividends'] if not actions.empty and 'Dividends' in actions.columns else pd.Series(dtype=float)
     except:
         divs = pd.Series(dtype=float)
     
-    # TTM Dividend Logic
+    price = safe_float(info.get("currentPrice") or info.get("previousClose"))
+    if not price:
+        hist = stock.history(period="1d")
+        if not hist.empty: price = float(hist['Close'].iloc[-1])
+        else: raise ValueError("Price Unavailable")
+
+    # TTM Dividend Logic (Trailing 12 Months)
     now = pd.Timestamp.now(tz='UTC')
     ttm_sum = divs[divs.index > (now - pd.DateOffset(years=1))].sum() if not divs.empty else 0
     y1_sum = divs[(divs.index <= (now - pd.DateOffset(years=1))) & (divs.index > (now - pd.DateOffset(years=2)))].sum() if not divs.empty else 0
     y3_sum = divs[(divs.index <= (now - pd.DateOffset(years=3))) & (divs.index > (now - pd.DateOffset(years=4)))].sum() if not divs.empty else 0
 
-    # LSE Correction
     denom = price / 100 if ticker_symbol.endswith(".L") and price > 10 else price
     manual_yield = (ttm_sum / denom) * 100 if denom > 0 else 0
 
-    pe_val = safe_float(info.get("trailingPE"))
-    
     data = {
         "Ticker": ticker_symbol,
         "Market Cap": format_large_num(info.get("marketCap")),
         "Net Debt": format_large_num((info.get("totalDebt", 0) or 0) - (info.get("totalCash", 0) or 0)),
-        "PE Ratio": safe_round(pe_val) if (pe_val and pe_val > 0) else "Neg. EPS",
+        "PE Ratio": safe_round(info.get("trailingPE")) if safe_float(info.get("trailingPE", 0)) > 0 else "Neg. EPS",
         "Div Yield (%)": safe_round(manual_yield)
     }
 
-    # Growth Logic
+    # EPS & DPS Growth
     income = stock.financials
     if not income.empty and 'Diluted EPS' in income.index:
         eps = income.loc['Diluted EPS'].dropna()
@@ -109,26 +106,19 @@ st.title("📊 Global Stock Fundamental Analyser")
 
 c1, c2 = st.columns(2)
 with c1:
-    market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual (Suffix included in code)"])
+    market = st.selectbox("Select Market", ["Australia (ASX)", "United Kingdom (LSE)", "USA", "Manual (Suffixes included)"])
 with c2:
-    input_text = st.text_input("Enter Ticker Codes (comma separated)", value="GOOGL, WISE.L, FMG.AX, WTL.AX, TPC.AX")
+    input_text = st.text_input("Enter Ticker Codes", value="BHP, GOOGL, WISE.L")
 
-# Logic to clean tickers and apply suffixes correctly
+suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual (Suffixes included)": ""}
+target_suffix = suffix_map[market]
+
 if st.button("Analyse Stocks"):
-    suffix_map = {"Australia (ASX)": ".AX", "United Kingdom (LSE)": ".L", "USA": "", "Manual (Suffix included in code)": ""}
-    target_suffix = suffix_map[market]
-    
     raw_list = [t.strip().upper() for t in input_text.split(",") if t.strip()]
-    
     processed_tickers = []
     for t in raw_list:
-        # Strip existing suffixes to prevent BHP.AX.AX
-        base = t.split(".")[0]
-        # If user selected Manual or typed a suffix manually, prioritize that
-        if "." in t:
-            processed_tickers.append(t)
-        else:
-            processed_tickers.append(base + target_suffix)
+        clean_t = t if "." in t else t + target_suffix
+        processed_tickers.append(clean_t)
     
     results = []
     progress_bar = st.progress(0)
@@ -138,15 +128,13 @@ if st.button("Analyse Stocks"):
             try:
                 progress_bar.progress((i + 1) / len(processed_tickers))
                 results.append(get_financial_metrics(t))
-                time.sleep(1.0) # Compliance delay
+                time.sleep(2.0) # Slower delay for compliance
             except Exception as e:
                 st.warning(f"Could not retrieve {t}: {str(e)}")
     
     if results:
         df = pd.DataFrame(results).set_index("Ticker").T
         st.dataframe(df, use_container_width=True)
-        st.divider()
         img_buf = create_table_image(df)
-        st.download_button(label="📩 Download Table as Image", data=img_buf, file_name="stock_analysis.png", mime="image/png")
-
+        st.download_button(label="📩 Download Table as Image (PNG)", data=img_buf, file_name="stock_analysis.png", mime="image/png")
 
